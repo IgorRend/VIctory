@@ -106,10 +106,24 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         }
     }
 
+    let original_hash = blake3::hash(original);
+
+    // GTA6 Xbox v1.0.2.1 (b99f876b74d4a77f): patch the INT3 assert at RVA
+    // 0x4da6315 to NOP.  The assert fires when the streaming thread's GPU
+    // range lookup can't find the target address in its pool table.  In
+    // VIctory, CPU == GPU (identity mapping), so returning 0 (not found) is
+    // correct — the caller propagates the input address unchanged, which is
+    // exactly the behaviour we want.
+    if &original_hash.to_hex()[..16] == "b99f876b74d4a77f" {
+        if let Some(at) = info.rva_to_file_offset(0x4da6315) {
+            let _ = write(&mut bytes, at as usize, &[0x90]);
+        }
+    }
+
     Ok(PreparedImage {
         info,
         bytes,
-        original_hash: blake3::hash(original),
+        original_hash,
     })
 }
 

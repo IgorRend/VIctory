@@ -144,7 +144,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File { file, path: name },
+    );
     put(out, file)
 }
 
@@ -258,6 +261,26 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// The title's path, for logs.
+    path: String,
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        tracing::info!(path = self.path, "dstorage: file released");
+    }
+}
+
+/// What a request reads, for logs: its file's path, or "memory".
+fn source_name(request: &Request) -> &str {
+    if request.source.is_null() {
+        return "none";
+    }
+    if request.options & MEMORY_SOURCE != 0 {
+        return "memory";
+    }
+    // SAFETY: a file object we created; the title keeps it open.
+    &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -796,6 +819,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             intermediate_size = request.intermediate_size,
             tag = request.tag,
             name = text(request.name),
+            file = source_name(request),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -832,7 +856,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(&source, out).map_err(|hr| {
+            let head = &source[..source.len().min(8)];
+            fail(hr, &format!("zlib, source starts {head:02x?}"))
+        }),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1141,6 +1168,20 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    #[test]
+    fn failures_name_the_source() {
+        let (dir, file) = file_with(b"data");
+        let path = dir.path().join("data.bin");
+        let mut out = [0u8; 4];
+        let read = request(ZLIB, out.as_mut_ptr().cast(), 4, file, 0, 4);
+        assert_eq!(source_name(&read), path.to_string_lossy());
+        let memory = request(ZLIB | MEMORY_SOURCE, out.as_mut_ptr().cast(), 4, file, 0, 4);
+        assert_eq!(source_name(&memory), "memory");
+        let none = request(ZLIB, out.as_mut_ptr().cast(), 4, std::ptr::null(), 0, 4);
+        assert_eq!(source_name(&none), "none");
+        void(file, 0x10);
     }
 
     #[test]
