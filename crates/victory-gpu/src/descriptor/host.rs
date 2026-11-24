@@ -559,6 +559,10 @@ fn buffer_uav(
     }
     buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
+    // D3D12 requires NumElements >= 1; Xbox tolerates 0 (null/disabled slot).
+    if buffer.NumElements == 0 {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {

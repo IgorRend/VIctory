@@ -16,10 +16,13 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+    ID3D12Resource,
+};
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
@@ -37,6 +40,11 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// Whether a shader used this buffer as a UAV in the current or most
+    /// recent submission. When true, the D3D12 resource may be in
+    /// UNORDERED_ACCESS state; a barrier back to VB/IB state is required
+    /// before the next vertex or index buffer bind.
+    in_uav: AtomicBool,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -116,6 +124,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
+            in_uav: AtomicBool::new(false),
             pending: Mutex::default(),
             before: Mutex::default(),
         }
@@ -140,6 +149,30 @@ impl Shadow {
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Records that a shader will use this buffer as a UAV in the current
+    /// submission. The D3D12 resource may enter UNORDERED_ACCESS state; a
+    /// call to [`Shadow::ensure_vb`] is required before the next vertex or
+    /// index buffer bind.
+    pub(crate) fn mark_uav(&self) {
+        self.in_uav.store(true, Ordering::Relaxed);
+    }
+
+    /// Ensures the D3D12 resource is in a state compatible with vertex or
+    /// index buffer use. If the buffer was last used as a UAV, inserts an
+    /// explicit UNORDERED_ACCESS → VERTEX_AND_CONSTANT_BUFFER barrier into
+    /// `list` before the bind.
+    pub(crate) fn ensure_vb(&self, list: &crate::host::HostList) {
+        if self.in_uav.swap(false, Ordering::Relaxed) {
+            let barrier = crate::host::transition(
+                &self.buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            );
+            // SAFETY: an open command list; the buffer is live.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders

@@ -371,6 +371,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.ensure_vb(list);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -389,6 +390,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.ensure_vb(list);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1115,6 +1117,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
+            shadow.mark_uav();
             shadow.gpu_writes(list, address, len);
         }
     }
