@@ -8,7 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -79,6 +79,10 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// Shadow buffers whose UAV usage was recorded during bind() but whose
+    /// dispatch/draw has not yet executed.  Drained and committed after a
+    /// successful GPU call; cleared (without marking) if the call is dropped.
+    uav_staged: Vec<Arc<crate::shadow::Shadow>>,
 }
 
 impl Drop for State {
@@ -458,11 +462,13 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let mut staged = std::mem::take(&mut self.uav_staged);
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, compute, &mut staged);
             if self.table_failed {
+                staged.clear();
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
@@ -515,6 +521,7 @@ impl State {
                 }
             }
         }
+        self.uav_staged = staged;
         true
     }
 
@@ -548,6 +555,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        for s in self.uav_staged.drain(..) { s.mark_uav(); }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -600,6 +608,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    for s in self.uav_staged.drain(..) { s.mark_uav(); }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -620,7 +629,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool, staged: &mut Vec<Arc<crate::shadow::Shadow>>) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -632,7 +641,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+            readable(list, u, &view, staged);
         }
     }
 
@@ -647,7 +656,7 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool, staged: &mut Vec<Arc<crate::shadow::Shadow>>) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -680,7 +689,7 @@ impl State {
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, staged);
             }
         }
         let mut made = Vec::new();
@@ -719,7 +728,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        readable(list, u, &view, staged);
                     }
                 }
                 made.push((slot, first * 32));
@@ -754,7 +763,7 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, staged);
                         }
                     }
                     None => {
@@ -862,6 +871,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            for s in self.uav_staged.drain(..) { s.mark_uav(); }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -949,6 +959,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            for s in self.uav_staged.drain(..) { s.mark_uav(); }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1104,7 +1115,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+fn readable(list: &HostList, u: &UsedResource, view: &View, staged: &mut Vec<Arc<crate::shadow::Shadow>>) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1117,7 +1128,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
-            shadow.mark_uav();
+            staged.push(Arc::clone(&shadow));
             shadow.gpu_writes(list, address, len);
         }
     }
