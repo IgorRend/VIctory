@@ -238,6 +238,11 @@ pub(crate) fn dump_targets(frame: u64) {
         if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
             continue;
         }
+        // Large targets only: the scene and its composite. The G-buffers and
+        // the small per-pass targets are numerous and slow to read back.
+        if d.Width < 1024 {
+            continue;
+        }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
@@ -498,24 +503,36 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             .flat_map(|pixel| pixel[..3].iter().copied())
             .max()
             .unwrap_or(0);
+        let min = bytes
+            .chunks(SLOT as usize)
+            .flat_map(|pixel| pixel[..3].iter().copied())
+            .min()
+            .unwrap_or(0);
         buffer.Unmap(0, None);
         let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
         if levels.len() == 12 {
             levels.pop_front();
         }
-        levels.push_back(level);
+        levels.push_back((level, level - min));
         level < 8
     }
 }
 
 /// The brightest probed channel of the last frames, oldest first: a fade
 /// darkens over several, a glitch drops at once.
-static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
+static LEVELS: std::sync::Mutex<std::collections::VecDeque<(u8, u8)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-    levels.iter().copied().collect()
+    levels.iter().map(|&(level, _)| level).collect()
+}
+
+/// The brightness spread (max minus min) of the last frames: 0 for a flat
+/// clear colour, large when the frame holds an image.
+pub(crate) fn recent_spread() -> Vec<u8> {
+    let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
+    levels.iter().map(|&(_, spread)| spread).collect()
 }
 
 #[cfg(test)]

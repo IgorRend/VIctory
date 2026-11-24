@@ -275,6 +275,48 @@ extern "system" fn present(
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if frame % 100 == 0 || crate::capture::listed(frame) {
+        if planes > 0 && !plane_parameters.is_null() {
+            let mut text = String::new();
+            for i in 0..planes.min(8) {
+                // SAFETY: the title passes `planes` plane descriptions.
+                let p = unsafe { &*plane_parameters.add(i as usize) };
+                text.push_str(&format!("plane {i}: {} resource(s)", p.count));
+                if !p.resources.is_null() {
+                    for j in 0..p.count.min(4) {
+                        // SAFETY: the plane lists `count` resources.
+                        let r = unsafe { *p.resources.add(j as usize) };
+                        match crate::resource::host_resource(r) {
+                            Some(t) => {
+                                // SAFETY: a live resource.
+                                let d = unsafe { t.GetDesc() };
+                                text.push_str(&format!(
+                                    " [{j}] {:#x} {}x{} f{}",
+                                    r as usize, d.Width, d.Height, d.Format.0
+                                ));
+                            }
+                            None => text.push_str(&format!(" [{j}] (no host resource)")),
+                        }
+                    }
+                }
+                text.push_str("; ");
+            }
+            tracing::info!(planes, "{text}");
+        }
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if frame % 5 == 0 {
+        let spreads = crate::capture::recent_spread();
+        let levels = crate::capture::recent_levels();
+        tracing::info!(
+            frame,
+            level = levels.last().copied().unwrap_or(0),
+            spread = spreads.last().copied().unwrap_or(0),
+            recent = ?spreads,
+            "screen"
+        );
+    }
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.

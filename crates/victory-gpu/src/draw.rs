@@ -549,6 +549,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.note_presented_size(false, true);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -557,6 +559,35 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         for s in self.uav_staged.drain(..) { s.mark_uav(); }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        self.note_presented_size(true, true);
+    }
+
+    /// Diagnostics: names each pipeline that draws or dispatches into a
+    /// target as wide as the presented image, and whether it ran. The final
+    /// composite is the draw that reaches the swapchain; a dropped one there
+    /// leaves the screen at its clear colour.
+    #[cfg(feature = "diagnostics")]
+    fn note_presented_size(&self, ran: bool, compute: bool) {
+        let wide = self.targets.iter().any(|&t| {
+            crate::resource::host_resource(t as This)
+                .is_some_and(|r| unsafe { r.GetDesc().Width } >= 3840)
+        });
+        if !wide {
+            return;
+        }
+        static SEEN: std::sync::Mutex<Vec<(usize, bool)>> = std::sync::Mutex::new(Vec::new());
+        let key = (self.pipeline, ran);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+        tracing::info!(
+            ran,
+            "{}",
+            self.op_text(format!("presented-size pipeline {:#x}", self.pipeline), compute)
+        );
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -619,6 +650,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_presented_size(ran, false);
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -879,6 +912,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_presented_size(ran, false);
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -967,6 +1002,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_presented_size(ran, false);
     }
 }
 
